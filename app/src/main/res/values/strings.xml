@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Android Media Player</string>
+    <string name="device_name">Device Name</string>
+    <string name="device_name_hint">Living Room Speaker</string>
+    <string name="server_port">Server Port</string>
+    <string name="server_port_hint">8765</string>
+    <string name="start_service">Start Service</string>
+    <string name="stop_service">Stop Service</string>
+    <string name="service_running">Service Running</string>
+    <string name="service_stopped">Service Stopped</string>
+    <string name="notification_channel_name">Media Playback</string>
+    <string name="notification_channel_description">Shows media playback controls</string>
+    <string name="status_idle">Idle</string>
+    <string name="status_playing">Playing</string>
+    <string name="status_paused">Paused</string>
+    <string name="ip_address">IP Address</string>
+    <string name="debug_logs">Debug Logs</string>
+    <string name="clear">Clear</string>
+    <string name="logging_disabled">Logging disabled. Toggle switch to enable.</string>
+    <string name="check_update">Update</string>
+    <string name="checking_update">Checking...</string>
+    <string name="downloading_update">Downloading %d%%</string>
+    <string name="installing_update">Installing...</string>
+    <string name="no_update">Up to date</string>
+    <string name="update_available">Update available: v%s</string>
+    <string name="update_error">Error: %s</string>
+    <string name="update_server_host">Update Server</string>
+</resources>

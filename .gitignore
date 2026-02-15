@@ -1,1 +1,28 @@
+# Build outputs
+build/
+# Keep app/build/ but allow APKs
+app/build/*
+!app/build/outputs/
+app/build/outputs/*
+!app/build/outputs/apk/
+
+# Local SDK and JDK (downloaded by build.sh)
+android-sdk/
+jdk-local/
+gradle-local/
+
+# Gradle
+.gradle/
+local.properties
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
 __pycache__/
+*.pyc

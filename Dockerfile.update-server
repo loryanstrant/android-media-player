@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+# Install avahi-utils for mDNS resolution
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    avahi-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the update server script
+COPY update-server.py /app/
+
+# Create directory structure for mounted volumes
+RUN mkdir -p /app/app/build/outputs/apk/debug /app/app
+
+# Expose the update server port
+EXPOSE 8888
+
+CMD ["python3", "update-server.py"]

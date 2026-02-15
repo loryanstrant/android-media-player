@@ -1,0 +1,25 @@
+services:
+  update-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.update-server
+    network_mode: host
+    volumes:
+      # Mount the APK output directory so the server always serves the latest build
+      - ./app/build/outputs/apk/debug:/app/app/build/outputs/apk/debug:ro
+      # Mount the build-tools for aapt2 (reads version directly from APK files)
+      - ./android-sdk/build-tools:/app/android-sdk/build-tools:ro
+      # Mount the ADB platform-tools for device management
+      - ./android-sdk/platform-tools:/app/android-sdk/platform-tools:ro
+      # Mount ADB keys from project directory for portability
+      - ./android-sdk/keys:/root/.android:rw
+      # Persist logs and state data
+      - server-data:/app/data
+      # Mount D-Bus socket for avahi-browse mDNS resolution
+      - /var/run/dbus:/var/run/dbus:ro
+    environment:
+      - HOME=/root
+    restart: unless-stopped
+
+volumes:
+  server-data:
