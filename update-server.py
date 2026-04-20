@@ -754,6 +754,12 @@ WEB_UI_HTML = """
     <div id="toast" class="toast"></div>
 
     <script>
+        // App base URL — computed from the current page so fetches work both
+        // at origin root (http://host:9742/) and under a path prefix behind
+        // a reverse proxy that strips the prefix before forwarding
+        // (https://host/amplayer/).
+        const API_BASE = new URL('.', document.baseURI).href.replace(/\\/$/, '');
+
         let allLogs = [];
         let allDevices = [];
         let latestApkVersion = null;
@@ -831,7 +837,7 @@ WEB_UI_HTML = """
             if (ip && playerName) {
                 showToast('Setting media player name...');
                 try {
-                    const resp = await fetch('/api/set-player-name', {
+                    const resp = await fetch(`${API_BASE}/api/set-player-name`, {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({ip, name: playerName})
@@ -852,7 +858,7 @@ WEB_UI_HTML = """
             if (adbAddress && tabletName) {
                 showToast('Setting tablet name via ADB...');
                 try {
-                    const resp = await fetch('/api/set-tablet-name', {
+                    const resp = await fetch(`${API_BASE}/api/set-tablet-name`, {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({device: adbAddress, name: tabletName})
@@ -901,7 +907,7 @@ WEB_UI_HTML = """
 
             try {
                 showToast('Pairing...');
-                const pairResp = await fetch('/api/adb/pair', {
+                const pairResp = await fetch(`${API_BASE}/api/adb/pair`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ip, port: pairPort, code: pairCode})
@@ -932,7 +938,7 @@ WEB_UI_HTML = """
 
             try {
                 showToast('Connecting...');
-                const connResp = await fetch('/api/adb/connect', {
+                const connResp = await fetch(`${API_BASE}/api/adb/connect`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ip, port: connectPort})
@@ -954,7 +960,7 @@ WEB_UI_HTML = """
             if (!confirm('Push update via ADB to this device?')) return;
             showToast('Installing update...');
             try {
-                const resp = await fetch('/api/adb/push', {
+                const resp = await fetch(`${API_BASE}/api/adb/push`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({device: address})
@@ -981,7 +987,7 @@ WEB_UI_HTML = """
             if (!confirm('Set device owner?\\n\\nNote: All Google accounts must be removed first!')) return;
             showToast('Setting device owner...');
             try {
-                const resp = await fetch('/api/adb/device-owner', {
+                const resp = await fetch(`${API_BASE}/api/adb/device-owner`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({device: address})
@@ -997,7 +1003,7 @@ WEB_UI_HTML = """
         async function disablePlayProtect(address) {
             showToast('Disabling Play Protect...');
             try {
-                const resp = await fetch('/api/adb/disable-protect', {
+                const resp = await fetch(`${API_BASE}/api/adb/disable-protect`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({device: address})
@@ -1066,7 +1072,7 @@ WEB_UI_HTML = """
             if (!confirm(`Delete "${name}" from the devices list?\\n\\nThis will remove the device from tracking and disconnect ADB if connected.`)) return;
             showToast('Removing device...');
             try {
-                const resp = await fetch('/api/delete-device', {
+                const resp = await fetch(`${API_BASE}/api/delete-device`, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({ip: ip, adb_address: adbAddress})
@@ -1085,7 +1091,7 @@ WEB_UI_HTML = """
 
         async function fetchPlayerState(ip) {
             try {
-                const resp = await fetch(`/api/player-state/${ip}`);
+                const resp = await fetch(`${API_BASE}/api/player-state/${ip}`);
                 return await resp.json();
             } catch (e) {
                 return null;
@@ -1096,8 +1102,8 @@ WEB_UI_HTML = """
             try {
                 // Fetch both ADB and app devices
                 const [adbResp, appResp] = await Promise.all([
-                    fetch('/api/adb/devices'),
-                    fetch('/api/devices')
+                    fetch(`${API_BASE}/api/adb/devices`),
+                    fetch(`${API_BASE}/api/devices`)
                 ]);
                 const adbDevices = await adbResp.json();
                 const appDevices = await appResp.json();
@@ -1374,7 +1380,7 @@ WEB_UI_HTML = """
 
         async function fetchLogs() {
             try {
-                const resp = await fetch('/api/logs?limit=500');
+                const resp = await fetch(`${API_BASE}/api/logs?limit=500`);
                 allLogs = await resp.json();
                 filterLogs();
                 document.getElementById('log-count').textContent = allLogs.length;
@@ -1383,7 +1389,7 @@ WEB_UI_HTML = """
 
         async function fetchVersion() {
             try {
-                const resp = await fetch('/version');
+                const resp = await fetch(`${API_BASE}/version`);
                 const data = await resp.json();
                 if (data.available) {
                     latestApkVersion = data.versionName;
