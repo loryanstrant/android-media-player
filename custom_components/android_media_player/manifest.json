@@ -1,11 +1,12 @@
 {
   "domain": "android_media_player",
   "name": "Android Media Player",
-  "codeowners": [],
+  "codeowners": ["@siegeld"],
   "config_flow": true,
   "dependencies": ["media_source"],
-  "documentation": "https://github.com/your-repo/android-media-player",
+  "documentation": "https://github.com/siegeld/android-media-player",
   "iot_class": "local_push",
+  "issue_tracker": "https://github.com/siegeld/android-media-player/issues",
   "requirements": ["aiohttp>=3.8.0", "websockets>=10.0"],
   "version": "1.0.0"
 }
