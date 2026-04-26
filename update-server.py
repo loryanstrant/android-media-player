@@ -7,21 +7,27 @@ Features:
 - Web UI for monitoring connected devices and viewing logs
 """
 
+import concurrent.futures
 import http.server
 import json
 import os
+import queue
 import re
+import signal
+import socket
 import socketserver
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from collections import deque
 from urllib.parse import parse_qs, urlparse
 import threading
+import urllib.request
 
 PORT = 9742
-SERVER_VERSION = "3.0.5"  # Monitor/server version (separate from APK version)
+SERVER_VERSION = "3.1.0"  # Monitor/server version (separate from APK version)
 APK_DIR = Path(__file__).parent / "app/build/outputs/apk/debug"
 APK_PATH = APK_DIR / "app-debug.apk"  # Default path for backwards compatibility
 DATA_DIR = Path(__file__).parent / "data"
@@ -30,14 +36,28 @@ STATE_FILE = DATA_DIR / "state.json"
 ADB_PATH = Path(__file__).parent / "android-sdk/platform-tools/adb"
 PACKAGE = "com.example.androidmediaplayer"
 
+ADB_HOST = "127.0.0.1"
+ADB_PORT = 5037
+ENRICH_REFRESH_SECONDS = 90        # re-check device-owner/app-info on this cadence
+PLAYER_STATE_POLL_SECONDS = 2.5    # poll device :8765/state for online devices
+SSE_QUEUE_MAX = 32                 # bounded per-subscriber queue; slow consumers get dropped
+
 # Ensure data directory exists
 DATA_DIR.mkdir(exist_ok=True)
 
 # Thread-safe storage
 data_lock = threading.Lock()
 recent_logs = deque(maxlen=5000)  # Keep last 5000 logs in memory
-devices = {}  # device_id -> device info
-adb_devices = {}  # ip:port -> connection info
+devices = {}  # device_id -> device info (legacy app-side check-ins)
+adb_devices = {}  # ip:port -> connection info (legacy; populated by manual connect)
+
+# Single-worker queue for ad-hoc adb commands. Serializes pair/connect/install/etc.
+# so concurrent dashboard actions never trample each other through fork-server.
+adb_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="adb-cmd")
+# Pool for parallel HTTP probes against device :8765 endpoints.
+http_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="http-poll")
+
+shutdown_event = threading.Event()
 
 
 def get_apk_version_from_file(apk_path):
@@ -114,7 +134,7 @@ def get_apk_version():
 
 
 def save_log_entry(entry):
-    """Save a log entry to file and memory."""
+    """Save a log entry to file and memory, and push to SSE subscribers."""
     with data_lock:
         recent_logs.append(entry)
         try:
@@ -122,6 +142,7 @@ def save_log_entry(entry):
                 f.write(json.dumps(entry) + "\n")
         except Exception as e:
             print(f"Error writing log: {e}")
+    publish_logs_event([entry])
 
 
 def update_device(device_id, info):
@@ -172,22 +193,685 @@ def delete_device(ip=None, adb_address=None):
     return removed
 
 
+def _adb_binary():
+    return str(ADB_PATH) if ADB_PATH.exists() else "adb"
+
+
 def run_adb(*args, timeout=30):
-    """Run an ADB command and return result."""
-    adb = str(ADB_PATH) if ADB_PATH.exists() else "adb"
-    cmd = [adb] + list(args)
+    """Run an adb command, killing the entire process group on timeout.
+
+    Uses Popen with start_new_session=True so a stuck adb invocation cannot
+    leave grandchildren (server connections, shell helpers) behind: on
+    timeout we SIGKILL the process group, then communicate() reaps cleanly.
+    """
+    cmd = [_adb_binary()] + list(args)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return {
-            "success": result.returncode == 0,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode
-        }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "error": "Command timed out"}
-    except Exception as e:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as e:
         return {"success": False, "error": str(e)}
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Kill whole process group to clean up any forks adb may have made.
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        return {"success": False, "error": "Command timed out", "stdout": "", "stderr": ""}
+
+    return {
+        "success": proc.returncode == 0,
+        "stdout": stdout,
+        "stderr": stderr,
+        "returncode": proc.returncode,
+    }
+
+
+def ensure_adb_server():
+    """Start the adb server explicitly so we can talk to it on :5037.
+
+    Idempotent — `adb start-server` is a no-op if already running. Run with
+    detached stdio so adb's daemon-detach logic isn't confused by inherited
+    pipes from a parent that's also the container's PID 1.
+    """
+    cmd = [_adb_binary(), "start-server"]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+            return False
+        return proc.returncode == 0
+    except OSError as e:
+        print(f"ensure_adb_server: failed to start adb: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Device registry, broadcaster, ADB monitor, enrichment, player-state poller.
+#
+# Architecture:
+#   AdbMonitor connects to localhost:5037 and runs `host:track-devices-l`.
+#   The adb server pushes a fresh device list whenever any device transitions.
+#   The monitor parses each push, updates DeviceRegistry, and triggers
+#   enrichment for newly-arrived devices via the single-worker adb_executor.
+#   PlayerStatePoller queries each online device's HTTP API on a slow cadence.
+#   Broadcaster pushes registry snapshots over SSE to subscribed clients —
+#   the dashboard never polls the server.
+# ---------------------------------------------------------------------------
+
+
+class DeviceRegistry:
+    """Source of truth for ADB-known devices.
+
+    Keyed by adb address (the string adb itself uses). Serial is the
+    canonical de-dup key once we've discovered it via enrichment.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._by_addr = {}            # addr -> dict
+        self._enriched_serials = set()  # serials we've fully enriched at least once
+        self._listeners = []          # callables fired on any state change
+
+    def add_listener(self, fn):
+        with self._lock:
+            self._listeners.append(fn)
+
+    def _notify(self):
+        # Listeners are called with the lock released to avoid deadlocks.
+        listeners = list(self._listeners)
+        for fn in listeners:
+            try:
+                fn()
+            except Exception as e:
+                print(f"registry listener error: {e}")
+
+    def replace_from_track(self, parsed):
+        """Replace tracked-device state from a track-devices-l snapshot.
+
+        `parsed` is a list of dicts with at least 'address' and 'state'.
+        Removes addresses no longer present, adds new ones, updates state on
+        existing entries. Returns (new_addrs, removed_addrs).
+        """
+        new_addrs, removed_addrs = [], []
+        with self._lock:
+            seen = set()
+            for d in parsed:
+                addr = d["address"]
+                seen.add(addr)
+                entry = self._by_addr.get(addr)
+                if entry is None:
+                    entry = {
+                        "address": addr,
+                        "state": d.get("state", "unknown"),
+                        "model": d.get("model"),
+                        "serial": None,
+                        "is_device_owner": False,
+                        "name": None,
+                        "version": None,
+                        "ip": None,
+                        "resolved_ip": None,
+                        "player_state": None,
+                        "first_seen": datetime.now().isoformat(),
+                        "last_state_change": datetime.now().isoformat(),
+                        "enrichment_pending": False,
+                        "enriched_at": None,
+                    }
+                    self._by_addr[addr] = entry
+                    new_addrs.append(addr)
+                else:
+                    if entry["state"] != d.get("state"):
+                        entry["state"] = d.get("state", "unknown")
+                        entry["last_state_change"] = datetime.now().isoformat()
+                    # Model only known once a device is "device" (online).
+                    if d.get("model") and not entry.get("model"):
+                        entry["model"] = d["model"]
+            for addr in list(self._by_addr.keys()):
+                if addr not in seen:
+                    removed_addrs.append(addr)
+                    del self._by_addr[addr]
+        if new_addrs or removed_addrs:
+            self._notify()
+        return new_addrs, removed_addrs
+
+    def update(self, addr, **fields):
+        with self._lock:
+            entry = self._by_addr.get(addr)
+            if entry is None:
+                return False
+            entry.update(fields)
+        self._notify()
+        return True
+
+    def update_player_state(self, addr, state):
+        # Player state changes don't need to fan out a full notify storm —
+        # we still notify, but callers can throttle if needed.
+        return self.update(addr, player_state=state)
+
+    def mark_enriched(self, addr, serial):
+        with self._lock:
+            entry = self._by_addr.get(addr)
+            if entry is None:
+                return
+            entry["enrichment_pending"] = False
+            entry["enriched_at"] = datetime.now().isoformat()
+            if serial:
+                entry["serial"] = serial
+                self._enriched_serials.add(serial)
+        self._notify()
+
+    def claim_enrichment(self, addr):
+        """Atomically mark a device's enrichment as in-flight. Returns True
+        if the caller should run enrichment, False if someone else has it.
+        """
+        with self._lock:
+            entry = self._by_addr.get(addr)
+            if entry is None or entry.get("enrichment_pending"):
+                return False
+            entry["enrichment_pending"] = True
+            return True
+
+    def needs_refresh(self, addr, max_age_seconds):
+        with self._lock:
+            entry = self._by_addr.get(addr)
+            if entry is None or entry.get("state") != "device":
+                return False
+            if entry.get("enrichment_pending"):
+                return False
+            ts = entry.get("enriched_at")
+            if not ts:
+                return True
+            try:
+                dt = datetime.fromisoformat(ts)
+            except ValueError:
+                return True
+            return (datetime.now() - dt).total_seconds() >= max_age_seconds
+
+    def online_addresses_with_ip(self):
+        with self._lock:
+            return [
+                (addr, entry.get("resolved_ip") or entry.get("ip"))
+                for addr, entry in self._by_addr.items()
+                if entry.get("state") == "device"
+                and (entry.get("resolved_ip") or entry.get("ip"))
+            ]
+
+    def all_addresses(self):
+        with self._lock:
+            return list(self._by_addr.keys())
+
+    def snapshot(self):
+        with self._lock:
+            # Deep-ish copy: each entry is a flat dict so a shallow copy is enough.
+            return [dict(e) for e in self._by_addr.values()]
+
+    def deduped_snapshot(self):
+        """Snapshot collapsed by serial (so the same physical tablet seen
+        via both IP:port and mDNS shows up once). Falls back to address
+        when serial isn't yet known.
+        """
+        seen_by_serial = {}
+        ungrouped = []
+        for d in self.snapshot():
+            serial = d.get("serial")
+            if not serial:
+                ungrouped.append(d)
+                continue
+            existing = seen_by_serial.get(serial)
+            if existing is None:
+                seen_by_serial[serial] = d
+            else:
+                # Prefer the IP:port address over an mDNS name.
+                cur = existing.get("address", "")
+                new = d.get("address", "")
+                if new and ":" in new and not new.startswith("adb-") and (
+                    cur.startswith("adb-") or ":" not in cur
+                ):
+                    seen_by_serial[serial] = d
+        return list(seen_by_serial.values()) + ungrouped
+
+    def remove(self, addr):
+        with self._lock:
+            existed = self._by_addr.pop(addr, None) is not None
+        if existed:
+            self._notify()
+        return existed
+
+
+registry = DeviceRegistry()
+
+
+class Broadcaster:
+    """Fan-out for SSE subscribers.
+
+    Each subscriber gets a bounded queue. If a queue fills up (slow consumer),
+    the oldest message is dropped — we never block a publisher.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._subs = []  # list of queue.Queue
+
+    def subscribe(self):
+        q = queue.Queue(maxsize=SSE_QUEUE_MAX)
+        with self._lock:
+            self._subs.append(q)
+        return q
+
+    def unsubscribe(self, q):
+        with self._lock:
+            try:
+                self._subs.remove(q)
+            except ValueError:
+                pass
+
+    def publish(self, message):
+        with self._lock:
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait(message)
+            except queue.Full:
+                # Slow consumer — drop oldest, then push.
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    q.put_nowait(message)
+                except queue.Full:
+                    pass
+
+    def subscriber_count(self):
+        with self._lock:
+            return len(self._subs)
+
+
+broadcaster = Broadcaster()
+
+
+def _parse_track_devices_payload(text):
+    """Parse the body adb's track-devices-l service emits.
+
+    Each non-empty line: "<serial-or-addr>\t<state> [<key>:<value> ...]".
+    """
+    devices_out = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        addr = parts[0]
+        state = parts[1]
+        model = None
+        for p in parts[2:]:
+            if p.startswith("model:"):
+                model = p.split(":", 1)[1]
+                break
+        devices_out.append({"address": addr, "state": state, "model": model})
+    return devices_out
+
+
+class AdbMonitor(threading.Thread):
+    """Background thread that streams device state from adb's host service.
+
+    Talks the adb wire protocol directly to localhost:5037 — never spawns
+    `adb` subprocesses for tracking. Reconnects with capped backoff on
+    failure, calling ensure_adb_server() to bring the daemon back up.
+    """
+
+    def __init__(self, registry, on_new_device=None):
+        super().__init__(daemon=True, name="adb-monitor")
+        self.registry = registry
+        self.on_new_device = on_new_device
+        self._sock = None
+
+    def stop(self):
+        try:
+            if self._sock is not None:
+                self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def _connect(self):
+        s = socket.create_connection((ADB_HOST, ADB_PORT), timeout=10)
+        # Once connected we want the read to block; the adb server may go
+        # arbitrarily long between updates.
+        s.settimeout(None)
+        return s
+
+    def _send_request(self, sock, command):
+        payload = command.encode("ascii")
+        sock.sendall(b"%04x" % len(payload) + payload)
+        status = self._read_exact(sock, 4)
+        if status != b"OKAY":
+            # Try to read the failure message.
+            try:
+                err_len_hex = self._read_exact(sock, 4).decode("ascii")
+                err_len = int(err_len_hex, 16)
+                err = self._read_exact(sock, err_len).decode("utf-8", "replace")
+            except Exception:
+                err = "unknown"
+            raise RuntimeError(f"adb host service rejected {command!r}: {err}")
+
+    @staticmethod
+    def _read_exact(sock, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("adb server closed connection")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def _read_message(self, sock):
+        length_hex = self._read_exact(sock, 4).decode("ascii")
+        length = int(length_hex, 16)
+        if length == 0:
+            return ""
+        return self._read_exact(sock, length).decode("utf-8", "replace")
+
+    def run(self):
+        backoff = 1.0
+        while not shutdown_event.is_set():
+            try:
+                ensure_adb_server()
+                self._sock = self._connect()
+                self._send_request(self._sock, "host:track-devices-l")
+                backoff = 1.0  # successful connect resets backoff
+                print("adb-monitor: connected to adb server, tracking devices")
+                while not shutdown_event.is_set():
+                    body = self._read_message(self._sock)
+                    parsed = _parse_track_devices_payload(body)
+                    new_addrs, removed_addrs = self.registry.replace_from_track(parsed)
+                    if new_addrs and self.on_new_device:
+                        for addr in new_addrs:
+                            try:
+                                self.on_new_device(addr)
+                            except Exception as e:
+                                print(f"adb-monitor on_new_device error: {e}")
+                    if removed_addrs:
+                        print(f"adb-monitor: devices removed: {removed_addrs}")
+            except Exception as e:
+                if shutdown_event.is_set():
+                    break
+                print(f"adb-monitor: connection lost ({e!r}); retrying in {backoff:.1f}s")
+                shutdown_event.wait(backoff)
+                backoff = min(backoff * 2, 30.0)
+            finally:
+                try:
+                    if self._sock is not None:
+                        self._sock.close()
+                except OSError:
+                    pass
+                self._sock = None
+
+
+# ---------- Enrichment (slow-path adb shell calls, serialized) -------------
+
+
+def _enrich_device(addr):
+    """Populate serial / device-owner / app info / IP for a single device.
+
+    Runs on the single-worker adb_executor so concurrent enrichment never
+    multiplies adb shell calls. Updates the registry on completion.
+    """
+    if shutdown_event.is_set():
+        return
+    serial = None
+    is_device_owner = False
+    app_name = None
+    app_version = None
+    resolved_ip = None
+    ip = None
+
+    # Serial — short, cheap, stable.
+    r = run_adb("-s", addr, "shell", "getprop", "ro.serialno", timeout=10)
+    if r.get("success"):
+        serial = r["stdout"].strip() or None
+
+    # Resolved IP for the device. For IP:port addresses it's just the IP.
+    if ":" in addr and not addr.startswith("adb-"):
+        ip = addr.split(":", 1)[0]
+    else:
+        r = run_adb("-s", addr, "shell", "ip", "route", "get", "1", timeout=10)
+        if r.get("success"):
+            m = re.search(r"src\s+(\d+\.\d+\.\d+\.\d+)", r.get("stdout", ""))
+            if m:
+                ip = m.group(1)
+        if not ip:
+            ip = resolve_mdns_to_ip(addr)
+        if ip:
+            resolved_ip = ip
+
+    # Device owner. dumpsys is heavy but only runs once per enrichment cycle.
+    r = run_adb("-s", addr, "shell", "dumpsys", "device_policy", timeout=15)
+    if r.get("success"):
+        out = r.get("stdout", "")
+        is_device_owner = "Device Owner" in out and PACKAGE in out
+
+    # App name/version via the device's own HTTP API (cheap, doesn't go through adb).
+    if ip:
+        try:
+            req = urllib.request.Request(
+                f"http://{ip}:8765/", headers={"User-Agent": "UpdateServer"}
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                data = json.loads(resp.read().decode())
+                app_name = data.get("name") or app_name
+                app_version = data.get("version") or app_version
+        except Exception:
+            pass
+
+    fields = {
+        "is_device_owner": is_device_owner,
+        "ip": ip,
+        "resolved_ip": resolved_ip,
+    }
+    if app_name:
+        fields["name"] = app_name
+    if app_version:
+        fields["version"] = app_version
+    registry.update(addr, **fields)
+    registry.mark_enriched(addr, serial)
+
+
+def schedule_enrichment(addr):
+    """Schedule an enrichment for `addr` if not already in flight."""
+    if not registry.claim_enrichment(addr):
+        return
+    adb_executor.submit(_enrich_device, addr)
+
+
+class EnrichmentRefresher(threading.Thread):
+    """Periodically re-enriches stale device entries (device-owner status,
+    app version) so the dashboard reflects changes that happen out-of-band.
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True, name="enrichment-refresher")
+
+    def run(self):
+        while not shutdown_event.is_set():
+            for addr in registry.all_addresses():
+                if shutdown_event.is_set():
+                    return
+                if registry.needs_refresh(addr, ENRICH_REFRESH_SECONDS):
+                    schedule_enrichment(addr)
+            shutdown_event.wait(15)
+
+
+# ---------- Player-state polling (HTTP, parallelized via http_executor) ----
+
+
+def _fetch_player_state(ip):
+    try:
+        req = urllib.request.Request(
+            f"http://{ip}:8765/state", headers={"User-Agent": "UpdateServer"}
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+class PlayerStatePoller(threading.Thread):
+    """Polls each online device's :8765/state and updates the registry.
+
+    Uses http_executor to fan out concurrently — total wall time per cycle
+    is ~one HTTP timeout regardless of fleet size. The dashboard receives
+    the change via SSE, so per-client polling is no longer needed.
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True, name="player-state-poller")
+
+    def run(self):
+        while not shutdown_event.is_set():
+            targets = registry.online_addresses_with_ip()
+            if targets:
+                futures = {
+                    http_executor.submit(_fetch_player_state, ip): (addr, ip)
+                    for addr, ip in targets
+                }
+                for fut in concurrent.futures.as_completed(futures, timeout=5):
+                    addr, _ip = futures[fut]
+                    try:
+                        state = fut.result()
+                    except Exception:
+                        state = None
+                    if state and not state.get("error"):
+                        registry.update_player_state(addr, state)
+            shutdown_event.wait(PLAYER_STATE_POLL_SECONDS)
+
+
+# ---------- View assembly + SSE publish wiring -----------------------------
+
+
+def build_devices_view():
+    """Build the merged devices list the dashboard renders.
+
+    Combines ADB-known devices (from registry) with app-side check-ins
+    (from the legacy `devices` dict), keyed by IP when possible.
+    """
+    adb_entries = registry.deduped_snapshot()
+    with data_lock:
+        app_devices_snapshot = {k: dict(v) for k, v in devices.items()}
+
+    merged = {}
+    for d in adb_entries:
+        addr = d["address"]
+        ip = d.get("resolved_ip") or d.get("ip")
+        if not ip and ":" in addr and not addr.startswith("adb-"):
+            ip = addr.split(":", 1)[0]
+        key = ip or d.get("serial") or addr
+        merged[key] = {
+            "name": d.get("name") or d.get("model") or addr,
+            "ip": ip,
+            "adb_address": addr,
+            "is_device_owner": bool(d.get("is_device_owner")),
+            "adb_connected": d.get("state") == "device",
+            "adb_state": d.get("state"),
+            "app_connected": False,
+            "version": d.get("version"),
+            "last_seen": None,
+            "player_state": d.get("player_state"),
+            "model": d.get("model"),
+            "serial": d.get("serial"),
+            "resolved_ip": d.get("resolved_ip"),
+        }
+
+    for did, info in app_devices_snapshot.items():
+        ip = info.get("ip_address")
+        if ip and ip in merged:
+            merged[ip]["version"] = info.get("app_version") or merged[ip].get("version")
+            merged[ip]["last_seen"] = info.get("last_seen")
+            merged[ip]["app_connected"] = True
+        else:
+            key = ip or did
+            merged[key] = {
+                "name": info.get("device_name") or did,
+                "ip": ip,
+                "adb_address": None,
+                "is_device_owner": False,
+                "adb_connected": False,
+                "adb_state": None,
+                "app_connected": True,
+                "version": info.get("app_version"),
+                "last_seen": info.get("last_seen"),
+                "player_state": None,
+                "model": None,
+                "serial": None,
+                "resolved_ip": None,
+            }
+
+    return list(merged.values())
+
+
+def _registry_changed():
+    """Listener on registry changes: publish a fresh devices snapshot."""
+    payload = json.dumps({"type": "devices", "devices": build_devices_view()})
+    broadcaster.publish(payload)
+
+
+registry.add_listener(_registry_changed)
+
+
+def publish_logs_event(entries):
+    """Push log entries to SSE subscribers (no-op if nobody subscribed)."""
+    if not entries:
+        return
+    if broadcaster.subscriber_count() == 0:
+        return
+    payload = json.dumps({"type": "logs", "logs": entries})
+    broadcaster.publish(payload)
+
+
+def publish_devices_now():
+    """Force-publish the current snapshot (e.g., after a manual mutation)."""
+    payload = json.dumps({"type": "devices", "devices": build_devices_view()})
+    broadcaster.publish(payload)
+
+
+def run_in_adb_executor(fn, *args, timeout=180):
+    """Submit an adb command to the single-worker queue and wait.
+
+    Serializes user-initiated adb operations so concurrent dashboard clicks
+    can't pile up parallel adb invocations. Internal enrichment runs on the
+    same executor — calls block behind in-flight work, which is what we want.
+    """
+    fut = adb_executor.submit(fn, *args)
+    try:
+        return fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        return {"success": False, "message": "ADB queue timeout"}
 
 
 def adb_pair(ip, port, code):
@@ -1160,22 +1844,9 @@ WEB_UI_HTML = """
                 document.getElementById('device-count').textContent = allDevices.length;
                 renderDevices();
                 updateDeviceFilter();
-
-                // Fetch player state for each device with an IP (update in-place, don't re-render)
-                for (const d of allDevices) {
-                    if (d.ip) {
-                        const deviceId = 'device-' + (d.ip || d.name).replace(/[^a-zA-Z0-9]/g, '-');
-                        fetchPlayerState(d.ip).then(state => {
-                            if (state && !state.error) {
-                                d.player_state = state;
-                                const card = document.getElementById(deviceId);
-                                if (card) {
-                                    updatePlayerStateInPlace(card, state);
-                                }
-                            }
-                        });
-                    }
-                }
+                // Player state for each device is pushed by the server via SSE
+                // (or fetched in bulk via /api/state on the fallback path) —
+                // no per-device polling needed from the browser.
             } catch (e) { console.error('Failed to fetch devices:', e); }
         }
 
@@ -1461,8 +2132,117 @@ WEB_UI_HTML = """
             fetchVersion();
         }
 
-        refreshAll();
-        setInterval(refreshAll, 5000);
+        // ----- Server-Sent Events: primary state transport -----
+        // The dashboard does NOT poll. The server pushes a full snapshot
+        // on connect and deltas on change. Polling fallback only kicks in
+        // when SSE is unavailable (proxy strips it, network issue).
+
+        let evtSource = null;
+        let sseFallbackTimer = null;
+
+        function applyDevicesPayload(devicesList) {
+            allDevices = devicesList || [];
+            document.getElementById('device-count').textContent = allDevices.length;
+            renderDevices();
+            updateDeviceFilter();
+        }
+
+        function applyLogsPayload(logs) {
+            allLogs = logs || [];
+            filterLogs();
+            document.getElementById('log-count').textContent = allLogs.length;
+        }
+
+        function applyApkPayload(apk) {
+            if (apk && apk.available) {
+                latestApkVersion = apk.versionName;
+                document.getElementById('apk-version').textContent = apk.versionName;
+                document.getElementById('apk-details').innerHTML =
+                    `Version: ${apk.versionName} (code ${apk.versionCode})<br>Size: ${(apk.size / 1024 / 1024).toFixed(2)} MB`;
+                renderDevices();
+            } else {
+                latestApkVersion = null;
+                document.getElementById('apk-version').textContent = 'N/A';
+                document.getElementById('apk-details').textContent = 'APK not found';
+            }
+        }
+
+        function appendLogs(newLogs) {
+            if (!newLogs || !newLogs.length) return;
+            allLogs = allLogs.concat(newLogs).slice(-2000);
+            filterLogs();
+            document.getElementById('log-count').textContent = allLogs.length;
+        }
+
+        async function fetchStateOnce() {
+            try {
+                const resp = await fetch(`${API_BASE}/api/state`);
+                const data = await resp.json();
+                applyDevicesPayload(data.devices);
+                applyLogsPayload(data.logs);
+                applyApkPayload(data.apk);
+            } catch (e) { console.error('Failed to fetch state:', e); }
+        }
+
+        function startFallbackPolling() {
+            if (sseFallbackTimer) return;
+            // Slow polling — only when SSE refuses to stay open. One bulk
+            // request fetches the same payload SSE would have pushed, so
+            // there's no per-device fan-out from the browser.
+            sseFallbackTimer = setInterval(fetchStateOnce, 15000);
+            fetchStateOnce();
+        }
+
+        function stopFallbackPolling() {
+            if (sseFallbackTimer) {
+                clearInterval(sseFallbackTimer);
+                sseFallbackTimer = null;
+            }
+        }
+
+        function connectEventStream() {
+            if (evtSource) {
+                try { evtSource.close(); } catch (e) {}
+            }
+            try {
+                evtSource = new EventSource(`${API_BASE}/api/events`);
+            } catch (e) {
+                startFallbackPolling();
+                return;
+            }
+            evtSource.onmessage = (ev) => {
+                stopFallbackPolling();
+                let msg;
+                try { msg = JSON.parse(ev.data); } catch (e) { return; }
+                if (msg.type === 'snapshot') {
+                    applyDevicesPayload(msg.devices);
+                    applyLogsPayload(msg.logs);
+                    applyApkPayload(msg.apk);
+                } else if (msg.type === 'devices') {
+                    applyDevicesPayload(msg.devices);
+                } else if (msg.type === 'logs') {
+                    appendLogs(msg.logs);
+                }
+            };
+            evtSource.onerror = () => {
+                // EventSource will auto-reconnect. If errors persist beyond
+                // the browser's retry budget we fall back to slow polling.
+                startFallbackPolling();
+            };
+            evtSource.onopen = () => {
+                stopFallbackPolling();
+            };
+        }
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') {
+                if (!evtSource || evtSource.readyState === 2 /* CLOSED */) {
+                    connectEventStream();
+                }
+            }
+        });
+
+        connectEventStream();
     </script>
 </body>
 </html>
@@ -1487,6 +2267,10 @@ class UpdateHandler(http.server.BaseHTTPRequestHandler):
             self.handle_get_devices()
         elif path == "/api/adb/devices":
             self.handle_get_adb_devices()
+        elif path == "/api/state":
+            self.handle_get_state()
+        elif path == "/api/events":
+            self.handle_events()
         elif path.startswith("/api/player-state/"):
             ip = path.split("/")[-1]
             self.handle_get_player_state(ip)
@@ -1577,6 +2361,106 @@ class UpdateHandler(http.server.BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 self.wfile.write(chunk)
+
+    def handle_get_state(self):
+        """Return the same snapshot SSE sends. Used by fallback polling."""
+        with data_lock:
+            logs = list(recent_logs)[-500:]
+        apk_path, vcode, vname = get_best_apk()
+        apk_info = (
+            {
+                "available": True,
+                "versionCode": vcode,
+                "versionName": vname,
+                "size": apk_path.stat().st_size,
+                "filename": apk_path.name,
+            }
+            if apk_path
+            else {"available": False}
+        )
+        body = json.dumps({
+            "devices": build_devices_view(),
+            "logs": logs,
+            "apk": apk_info,
+            "server_version": SERVER_VERSION,
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_events(self):
+        """Server-Sent Events stream of dashboard state.
+
+        On connect, emits a snapshot containing devices, logs and APK
+        version info. After that, only deltas are pushed: new logs as they
+        arrive, devices on registry changes (state, enrichment, player
+        state). Browser EventSource auto-reconnects on transport errors.
+        """
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")  # disable proxy buffering
+            self.end_headers()
+        except Exception:
+            return
+
+        q = broadcaster.subscribe()
+        try:
+            # Initial snapshot.
+            with data_lock:
+                logs = list(recent_logs)[-500:]
+            apk_path, vcode, vname = get_best_apk()
+            apk_info = (
+                {
+                    "available": True,
+                    "versionCode": vcode,
+                    "versionName": vname,
+                    "size": apk_path.stat().st_size,
+                    "filename": apk_path.name,
+                }
+                if apk_path
+                else {"available": False}
+            )
+            snapshot = {
+                "type": "snapshot",
+                "devices": build_devices_view(),
+                "logs": logs,
+                "apk": apk_info,
+                "server_version": SERVER_VERSION,
+            }
+            self._sse_write(json.dumps(snapshot))
+
+            # Push loop. Heartbeat comments every 15s keep proxies/firewalls
+            # from killing idle connections.
+            last_heartbeat = time.monotonic()
+            while not shutdown_event.is_set():
+                try:
+                    msg = q.get(timeout=5)
+                    self._sse_write(msg)
+                except queue.Empty:
+                    pass
+                if time.monotonic() - last_heartbeat > 15:
+                    try:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return
+                    last_heartbeat = time.monotonic()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+        finally:
+            broadcaster.unsubscribe(q)
+
+    def _sse_write(self, data_str):
+        # SSE frame: "data: <line>\n" repeated, terminated by blank line.
+        for line in data_str.splitlines() or [""]:
+            self.wfile.write(b"data: " + line.encode("utf-8") + b"\n")
+        self.wfile.write(b"\n")
+        self.wfile.flush()
 
     def handle_get_logs(self, query_string):
         """Return recent logs as JSON."""
@@ -1759,131 +2643,97 @@ class UpdateHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(400, str(e))
 
     def handle_get_adb_devices(self):
-        """Return list of ADB-connected devices, deduplicated by serial."""
-        raw_devices = get_adb_devices()
+        """Return list of ADB-connected devices from the registry.
 
-        # Deduplicate by serial number
-        seen_serials = {}
-        for d in raw_devices:
-            addr = d['address']
-            serial = get_device_serial(addr)
-
-            if serial and serial in seen_serials:
-                # Prefer IP:port over mDNS
-                if ':' in addr and not addr.startswith('adb-'):
-                    seen_serials[serial]['address'] = addr
-                continue
-
-            # Get device owner status
-            owner_info = adb_check_device_owner(addr)
-            d['is_device_owner'] = owner_info.get('is_device_owner', False)
-
-            # Get app name, version, and resolved IP
-            app_name, app_version, resolved_ip = get_device_app_info(addr)
-            if app_name:
-                d['name'] = app_name
-            else:
-                d['name'] = d.get('model', addr)
-            if app_version:
-                d['version'] = app_version
-            # If we resolved an mDNS name to IP, include it in the response
-            if resolved_ip and addr.startswith('adb-'):
-                d['resolved_ip'] = resolved_ip
-
-            d['serial'] = serial
-            if serial:
-                seen_serials[serial] = d
-            else:
-                seen_serials[addr] = d
-
-        devices_list = list(seen_serials.values())
-        body = json.dumps(devices_list).encode()
+        Backwards-compatible with the previous endpoint shape. Reads
+        in-memory state populated by AdbMonitor + enricher — never spawns
+        adb subprocesses on a request thread.
+        """
+        out = []
+        for d in registry.deduped_snapshot():
+            out.append(
+                {
+                    "address": d.get("address"),
+                    "status": d.get("state"),
+                    "model": d.get("model") or "",
+                    "name": d.get("name") or d.get("model") or d.get("address"),
+                    "version": d.get("version"),
+                    "is_device_owner": bool(d.get("is_device_owner")),
+                    "serial": d.get("serial"),
+                    "resolved_ip": d.get("resolved_ip"),
+                }
+            )
+        body = json.dumps(out).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(body))
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
     def handle_adb_pair(self):
-        """Pair with a device."""
+        """Pair with a device. Serialized through adb_executor."""
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode()
-            data = json.loads(body)
-            result = adb_pair(data['ip'], data['port'], data['code'])
-            body = json.dumps(result).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            data = json.loads(self.rfile.read(content_length).decode())
+            result = run_in_adb_executor(adb_pair, data['ip'], data['port'], data['code'])
+            self._send_json(result)
         except Exception as e:
             self.send_error(400, str(e))
 
     def handle_adb_connect(self):
-        """Connect to a device."""
+        """Connect to a device. Serialized through adb_executor."""
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode()
-            data = json.loads(body)
-            result = adb_connect(data['ip'], data['port'])
-            body = json.dumps(result).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            data = json.loads(self.rfile.read(content_length).decode())
+            result = run_in_adb_executor(adb_connect, data['ip'], data['port'])
+            if result.get('success'):
+                publish_devices_now()
+            self._send_json(result)
         except Exception as e:
             self.send_error(400, str(e))
 
     def handle_adb_push(self):
-        """Push APK update to device."""
+        """Push APK update to device. Serialized through adb_executor."""
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode()
-            data = json.loads(body)
+            data = json.loads(self.rfile.read(content_length).decode())
             device = data.get('device') or f"{data['ip']}:{data['port']}"
-            result = adb_push_update(device)
-            body = json.dumps(result).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            # Install can legitimately take a while on slow devices.
+            result = run_in_adb_executor(adb_push_update, device, timeout=300)
+            self._send_json(result)
         except Exception as e:
             self.send_error(400, str(e))
 
     def handle_adb_device_owner(self):
-        """Set device owner."""
+        """Set device owner. Serialized through adb_executor."""
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode()
-            data = json.loads(body)
+            data = json.loads(self.rfile.read(content_length).decode())
             device = data.get('device') or f"{data['ip']}:{data['port']}"
-            result = adb_set_device_owner(device)
-            body = json.dumps(result).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            result = run_in_adb_executor(adb_set_device_owner, device)
+            if result.get('success'):
+                # Force a re-enrichment so device-owner state refreshes promptly.
+                schedule_enrichment(device)
+            self._send_json(result)
         except Exception as e:
             self.send_error(400, str(e))
 
     def handle_adb_disable_protect(self):
-        """Disable Play Protect."""
+        """Disable Play Protect. Serialized through adb_executor."""
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode()
-            data = json.loads(body)
+            data = json.loads(self.rfile.read(content_length).decode())
             device = data.get('device') or f"{data['ip']}:{data['port']}"
-            result = adb_disable_play_protect(device)
-            body = json.dumps(result).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            result = run_in_adb_executor(adb_disable_play_protect, device)
+            self._send_json(result)
         except Exception as e:
             self.send_error(400, str(e))
 
@@ -1909,49 +2759,37 @@ class UpdateHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(400, str(e))
 
     def handle_set_tablet_name(self):
-        """Set tablet device name via ADB."""
+        """Set tablet device name via ADB. Serialized through adb_executor."""
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode()
-            data = json.loads(body)
+            data = json.loads(self.rfile.read(content_length).decode())
             device = data.get('device')
             name = data.get('name')
             if not device or not name:
                 self.send_error(400, "Missing 'device' or 'name' parameter")
                 return
-            result = adb_set_tablet_name(device, name)
-            body = json.dumps(result).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            result = run_in_adb_executor(adb_set_tablet_name, device, name)
+            self._send_json(result)
         except Exception as e:
             self.send_error(400, str(e))
 
     def handle_delete_device(self):
-        """Delete a device from tracking."""
+        """Delete a device from tracking. Serialized through adb_executor
+        because it issues `adb disconnect` calls."""
         try:
             content_length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_length).decode()
-            data = json.loads(body)
+            data = json.loads(self.rfile.read(content_length).decode())
             ip = data.get('ip')
             adb_address = data.get('adb_address')
             if not ip and not adb_address:
                 self.send_error(400, "Missing 'ip' or 'adb_address' parameter")
                 return
-            removed = delete_device(ip=ip, adb_address=adb_address)
-            result = {
-                "success": True,
-                "message": "Device removed",
-                "removed": removed
-            }
-            body = json.dumps(result).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", len(body))
-            self.end_headers()
-            self.wfile.write(body)
+            removed = run_in_adb_executor(delete_device, ip, adb_address)
+            # delete_device returns a dict, not a Result object
+            if adb_address:
+                registry.remove(adb_address)
+            publish_devices_now()
+            self._send_json({"success": True, "message": "Device removed", "removed": removed})
         except Exception as e:
             self.send_error(400, str(e))
 
@@ -1975,6 +2813,7 @@ def main():
     print(f"  http://0.0.0.0:{PORT}/         - Web UI (monitoring dashboard)")
     print(f"  http://0.0.0.0:{PORT}/version  - Version JSON")
     print(f"  http://0.0.0.0:{PORT}/apk      - Download APK")
+    print(f"  http://0.0.0.0:{PORT}/api/events - SSE state stream")
     print(f"  POST /log                      - Submit single log")
     print(f"  POST /logs                     - Submit multiple logs")
     print(f"  POST /checkin                  - Device check-in")
@@ -1983,11 +2822,43 @@ def main():
     print(f"  GET /api/devices               - Get devices (JSON)")
     print()
 
-    with ThreadedHTTPServer(("0.0.0.0", PORT), UpdateHandler) as httpd:
+    # Background workers. Order matters: bring up adb server before starting
+    # the monitor so its first connection succeeds.
+    ensure_adb_server()
+    monitor = AdbMonitor(registry, on_new_device=schedule_enrichment)
+    refresher = EnrichmentRefresher()
+    poller = PlayerStatePoller()
+    monitor.start()
+    refresher.start()
+    poller.start()
+
+    def _signal_shutdown(signum, frame):
+        print(f"\nReceived signal {signum}, shutting down...")
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _signal_shutdown)
+    signal.signal(signal.SIGINT, _signal_shutdown)
+
+    httpd = ThreadedHTTPServer(("0.0.0.0", PORT), UpdateHandler)
+    httpd.daemon_threads = True  # don't block shutdown on slow SSE clients
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("Shutting down workers...")
+        shutdown_event.set()
         try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print("\nShutting down...")
+            monitor.stop()
+        except Exception:
+            pass
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+        adb_executor.shutdown(wait=False, cancel_futures=True)
+        http_executor.shutdown(wait=False, cancel_futures=True)
+        # Threads are daemon — process exit reaps them.
 
 
 if __name__ == "__main__":

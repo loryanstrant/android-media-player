@@ -22,6 +22,28 @@ Git tags use the **Server version** (e.g., `v3.0.0`). APK versions are tracked s
 
 # Server/Monitor Changelog
 
+## [3.1.0] - 2026-04-26
+
+### Changed
+- **Architectural rewrite of the monitoring layer** to fix runaway ADB CPU and zombie processes
+  - **Push-based dashboard via Server-Sent Events** (`/api/events`) — the browser opens a single persistent stream and the server pushes snapshots and deltas; the previous 5-second polling loop is gone
+  - **Streaming device discovery via `host:track-devices-l`** — the server connects directly to the ADB host service over TCP/5037 and reacts to device-state changes as they happen, instead of polling `adb devices` every 5 seconds
+  - **In-memory device registry with one-shot enrichment** — serial, device-owner status, app version, and resolved IP are populated once when a device first appears and refreshed on a slow cadence (90s); the legacy "1 + 3N adb shell calls per dashboard poll" pattern is eliminated
+  - **Single-worker ADB executor** serializes all ad-hoc adb commands (pair / connect / install / set-owner / disable-protect / set-tablet-name / disconnect) so concurrent dashboard actions cannot trample each other through the fork-server
+  - **Server-side player-state polling** — the server polls each online device's `:8765/state` and broadcasts changes via SSE; the browser no longer fans out per-device requests
+  - **Hardened `run_adb`** uses `Popen(start_new_session=True)`; on timeout it sends `SIGKILL` to the entire process group and reaps via `communicate()` so stuck adb invocations cannot leave grandchildren behind
+  - New endpoint `/api/state` returns the same payload as the SSE snapshot, used as a fallback when SSE is unavailable
+
+### Fixed
+- **Runaway adb fork-server CPU (~45% sustained)** caused by ADB's openscreen mDNS implementation busy-looping on the `UDP/5353` multicast socket. Disabled via `ADB_MDNS=0` in `docker-compose.yml`; mDNS resolution still works via `avahi-browse` from update-server.py.
+- **Zombie adb processes** that accumulated when the fork-server died and was never reaped because update-server.py was the container's PID 1. Fixed by adding `init: true` to `docker-compose.yml` so `tini` reaps orphaned children, plus the hardened subprocess lifecycle in `run_adb`.
+
+### Added
+- `GET /api/events` - Server-Sent Events stream of device + log + APK state
+- `GET /api/state` - One-shot snapshot in the same shape as the SSE stream
+
+---
+
 ## [3.0.5] - 2026-01-18
 
 ### Changed
@@ -288,6 +310,8 @@ Git tags use the **Server version** (e.g., `v3.0.0`). APK versions are tracked s
 | 3.0.1 | 2026-01-18 | Fix ADB operations with mDNS device names |
 | 3.0.2 | 2026-01-18 | Outdated device highlighting in dashboard |
 | 3.0.4 | 2026-01-18 | Fix outdated device version comparison |
+| 3.0.5 | 2026-01-18 | Version bump for APK 2.0.7 release |
+| 3.1.0 | 2026-04-26 | Push-based SSE dashboard, streaming device discovery, fix runaway ADB CPU + zombies |
 
 ### APK Versions
 

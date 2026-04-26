@@ -3,6 +3,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.update-server
+    # tini as PID 1 reaps zombies (adb fork-server children orphaned via
+    # double-fork). Belt-and-suspenders alongside the in-process subprocess
+    # discipline in update-server.py.
+    init: true
     network_mode: host
     volumes:
       # Mount the APK output directory so the server always serves the latest build
@@ -19,6 +23,11 @@ services:
       - /var/run/dbus:/var/run/dbus:ro
     environment:
       - HOME=/root
+      # Disable adb's built-in mDNS discovery. The openscreen-based
+      # implementation busy-loops on the UDP/5353 multicast socket on
+      # this host (~10k syscalls/sec → ~45% CPU). We don't need it —
+      # update-server.py resolves _adb-tls-connect._tcp via avahi-browse.
+      - ADB_MDNS=0
     restart: unless-stopped
 
 volumes:

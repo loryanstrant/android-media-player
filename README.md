@@ -296,9 +296,11 @@ adb shell dpm set-device-owner com.example.androidmediaplayer/.receiver.DeviceAd
 Access the monitoring dashboard at `http://<server-ip>:9742/`
 
 **Dashboard Features:**
+- **Push-based updates via Server-Sent Events** - The browser opens a single persistent SSE stream (`/api/events`); the server pushes snapshots on connect and deltas on change. No client-side polling. Falls back to slow polling against `/api/state` if SSE is blocked by a proxy.
+- **Streaming ADB device discovery** - The server speaks the ADB host-service protocol directly (`host:track-devices-l` over TCP/5037) and reacts to device-state changes as the daemon emits them, instead of polling.
 - **Collapsible device cards** - Compact view by default; click +/- to expand for details and actions
 - **Unified device view** - Merged view of all devices (ADB + App API)
-- **mDNS auto-resolution** - Devices discovered via Android Wireless Debugging automatically resolve to IP addresses
+- **mDNS auto-resolution** - Devices discovered via Android Wireless Debugging automatically resolve to IP addresses (via `avahi-browse`; ADB's built-in mDNS is disabled because it busy-loops the UDP socket — see `ADB_MDNS=0` in `docker-compose.yml`).
 - Real-time device status (online/offline, device owner, ADB connected)
 - Version information for each device
 - Live log streaming with filtering
@@ -364,6 +366,10 @@ The app automatically enables remote logging when it detects an update server. T
 | `POST /checkin` | Device registration/heartbeat |
 | `POST /log` | Submit log entries |
 | `POST /track` | Report track played |
+| `GET /api/events` | Server-Sent Events stream of device + log + APK state (used by the dashboard) |
+| `GET /api/state` | One-shot snapshot in the same shape as the SSE stream (fallback for clients that can't use SSE) |
+| `GET /api/devices` | App-side device check-ins (legacy) |
+| `GET /api/adb/devices` | ADB-known devices (legacy; reads from the in-memory registry) |
 
 ---
 
