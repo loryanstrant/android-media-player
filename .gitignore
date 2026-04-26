@@ -26,3 +26,7 @@ Thumbs.db
 # Python
 __pycache__/
 *.pyc
+
+# Claude Code runtime state (keep .claude/commands/ tracked)
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
