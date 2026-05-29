@@ -8,13 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SDK_DIR="${SCRIPT_DIR}/android-sdk"
 JDK_DIR="${SCRIPT_DIR}/jdk-local/jdk-17.0.2"
 
-# Check if SDK is installed
-if [ ! -d "${SDK_DIR}/platform-tools" ]; then
-    echo "Android SDK not found. Running setup..."
-    "${SCRIPT_DIR}/setup-android-sdk.sh"
-fi
-
-# Check if JDK 17 is installed
+# Check if JDK 17 is installed FIRST (needed before SDK setup)
 if [ ! -d "${JDK_DIR}" ]; then
     echo "JDK 17 not found. Downloading..."
     mkdir -p "${SCRIPT_DIR}/jdk-local"
@@ -23,11 +17,17 @@ if [ ! -d "${JDK_DIR}" ]; then
     echo "JDK 17 installed."
 fi
 
-# Set environment (all local)
+# Export JAVA_HOME before any SDK tools are invoked
 export JAVA_HOME="${JDK_DIR}"
 export ANDROID_SDK_ROOT="${SDK_DIR}"
 export ANDROID_HOME="${SDK_DIR}"
 export PATH="${JAVA_HOME}/bin:${SDK_DIR}/cmdline-tools/latest/bin:${SDK_DIR}/platform-tools:${PATH}"
+
+# Now check/setup Android SDK (sdkmanager needs Java)
+if [ ! -d "${SDK_DIR}/platform-tools" ]; then
+    echo "Android SDK not found. Running setup..."
+    "${SCRIPT_DIR}/setup-android-sdk.sh"
+fi
 
 # Create local.properties for Gradle
 echo "sdk.dir=${SDK_DIR}" > "${SCRIPT_DIR}/local.properties"
