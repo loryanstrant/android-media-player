@@ -8,5 +8,5 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/siegeld/android-media-player/issues",
   "requirements": ["aiohttp>=3.8.0", "websockets>=10.0"],
-  "version": "1.0.0"
+  "version": "1.0.1"
 }
