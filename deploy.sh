@@ -62,8 +62,8 @@ if ! "${ADB}" -s "${DEVICE_IP}:${ADB_PORT}" get-state 2>/dev/null | grep -q "dev
     exit 1
 fi
 
-# Use specific device for all commands
-ADB="${ADB} -s ${DEVICE_IP}:${ADB_PORT}"
+# Use array for ADB command with specific device target
+ADB_CMD=("${ADB}" -s "${DEVICE_IP}:${ADB_PORT}")
 
 echo "=== Deploying Android Media Player ==="
 echo "Device name: ${DEVICE_NAME}"
@@ -72,20 +72,20 @@ echo ""
 
 # Install APK
 echo "Installing APK..."
-"${ADB}" install -r "${APK}"
+"${ADB_CMD[@]}" install -r "${APK}"
 
 # Grant notification permission (Android 13+, fails silently on older)
 echo "Granting permissions..."
-"${ADB}" shell pm grant "${PACKAGE}" android.permission.POST_NOTIFICATIONS 2>/dev/null || true
+"${ADB_CMD[@]}" shell pm grant "${PACKAGE}" android.permission.POST_NOTIFICATIONS 2>/dev/null || true
 
 # Add to battery optimization whitelist to prevent freezing
 echo "Adding to battery optimization whitelist..."
-"${ADB}" shell dumpsys deviceidle whitelist "+${PACKAGE}" 2>/dev/null || true
+"${ADB_CMD[@]}" shell dumpsys deviceidle whitelist "+${PACKAGE}" 2>/dev/null || true
 
 # Write config to shared preferences via adb
 echo "Configuring device..."
-"${ADB}" shell "run-as ${PACKAGE} sh -c 'mkdir -p shared_prefs'"
-"${ADB}" shell "run-as ${PACKAGE} sh -c 'cat > shared_prefs/media_player_prefs.xml << EOF
+"${ADB_CMD[@]}" shell "run-as ${PACKAGE} sh -c 'mkdir -p shared_prefs'"
+"${ADB_CMD[@]}" shell "run-as ${PACKAGE} sh -c 'cat > shared_prefs/media_player_prefs.xml << EOF
 <?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\" ?>
 <map>
     <string name=\"device_name\">${DEVICE_NAME}</string>
@@ -95,11 +95,11 @@ echo "Configuring device..."
 EOF'"
 
 # Force stop to pick up new prefs
-"${ADB}" shell am force-stop "${PACKAGE}"
+"${ADB_CMD[@]}" shell am force-stop "${PACKAGE}"
 
 # Start the service via activity (which will read prefs and start service)
 echo "Starting app..."
-"${ADB}" shell am start -n "${PACKAGE}/.MainActivity" \
+"${ADB_CMD[@]}" shell am start -n "${PACKAGE}/.MainActivity" \
     --es "auto_start" "true"
 
 # Wait a moment for service to start
