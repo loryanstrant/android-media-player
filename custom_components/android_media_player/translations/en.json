@@ -3,19 +3,37 @@
     "step": {
       "user": {
         "title": "Add Android Media Player",
-        "description": "Enter the IP address and port of your Android device running the Media Player app. The device name will be automatically retrieved from the tablet.",
+        "description": "Enter the primary IP address and port of your Android device running the Media Player app. You can optionally provide a secondary IP address for VPN/WireGuard failover. The device name will be automatically retrieved from the tablet.",
         "data": {
-          "host": "IP Address",
+          "host": "Primary IP Address",
+          "secondary_host": "Secondary IP Address (optional)",
           "port": "Port"
         }
       }
     },
     "error": {
-      "cannot_connect": "Cannot connect to device. Please check the IP address and port.",
+      "cannot_connect": "Cannot connect to device using the configured host(s). Please check the addresses and port.",
       "unknown": "An unknown error occurred."
     },
     "abort": {
       "already_configured": "This device is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Android Media Player options",
+        "description": "Update the primary/secondary host and port used to connect to your Android device.",
+        "data": {
+          "host": "Primary IP Address",
+          "secondary_host": "Secondary IP Address (optional)",
+          "port": "Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to device using the configured host(s). Please check the addresses and port.",
+      "unknown": "An unknown error occurred."
     }
   }
 }

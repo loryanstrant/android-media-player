@@ -2,13 +2,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
-from .const import DOMAIN, CONF_HOST, CONF_PORT, CONF_NAME
+from .const import DOMAIN, CONF_HOST, CONF_SECONDARY_HOST, CONF_PORT, CONF_NAME
 from .coordinator import AndroidMediaPlayerCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -20,11 +19,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Android Media Player from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
+    host = entry.options.get(CONF_HOST, entry.data[CONF_HOST])
+    secondary_host = entry.options.get(
+        CONF_SECONDARY_HOST, entry.data.get(CONF_SECONDARY_HOST)
+    )
+    port = entry.options.get(CONF_PORT, entry.data[CONF_PORT])
+    name = entry.options.get(CONF_NAME, entry.data.get(CONF_NAME, "Android Media Player"))
+
     coordinator = AndroidMediaPlayerCoordinator(
         hass,
-        entry.data[CONF_HOST],
-        entry.data[CONF_PORT],
-        entry.data.get(CONF_NAME, "Android Media Player"),
+        host,
+        port,
+        name,
+        secondary_host=secondary_host,
     )
 
     await coordinator.async_connect()

@@ -3,6 +3,7 @@
 DOMAIN = "android_media_player"
 
 CONF_HOST = "host"
+CONF_SECONDARY_HOST = "secondary_host"
 CONF_PORT = "port"
 CONF_NAME = "name"
 
