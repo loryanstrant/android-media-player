@@ -394,7 +394,8 @@ The app automatically enables remote logging when it detects an update server. T
 
 | Option | Required | Description |
 |--------|----------|-------------|
-| Host | Yes | IP address of Android device |
+| Host | Yes | Primary IP address of Android device |
+| Secondary Host | No | Optional fallback IP (for VPN/WireGuard/LAN split-network setups) |
 | Port | Yes | Server port (default: 8765) |
 | Name | No | Custom entity name |
 
@@ -404,6 +405,7 @@ The app automatically enables remote logging when it detects an update server. T
 # Not recommended - use the UI config flow instead
 android_media_player:
   - host: 192.168.1.100
+    secondary_host: 10.6.0.25
     port: 8765
     name: "Living Room Speaker"
 ```
@@ -621,6 +623,7 @@ Access the web dashboard at `http://<update-server>:9742/`:
 |----------|----------|
 | Android device reboots | Service auto-starts if previously running |
 | Home Assistant restarts | Integration reconnects with exponential backoff |
+| Device IP changes between LAN/VPN | Integration tries primary then secondary host and fails over automatically |
 | Network interruption | WebSocket reconnects automatically |
 | Command fails via WebSocket | Falls back to REST API |
 | Media player service crashes | Watchdog restarts within 30 seconds |

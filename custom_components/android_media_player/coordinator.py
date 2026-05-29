@@ -14,7 +14,6 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
-    DOMAIN,
     RECONNECT_INTERVAL_MIN,
     RECONNECT_INTERVAL_MAX,
     CONNECTION_TIMEOUT,
@@ -37,6 +36,7 @@ class AndroidMediaPlayerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         host: str,
         port: int,
         name: str,
+        secondary_host: str | None = None,
     ) -> None:
         """Initialize the coordinator."""
         super().__init__(
@@ -45,9 +45,12 @@ class AndroidMediaPlayerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             name=f"Android Media Player {name}",
             # No update_interval - we use push updates
         )
+        self.primary_host = host
+        self.secondary_host = secondary_host if secondary_host and secondary_host != host else None
         self.host = host
         self.port = port
         self.device_name = name
+        self._last_working_host: str | None = None
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._ws_task: asyncio.Task | None = None
@@ -58,8 +61,11 @@ class AndroidMediaPlayerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._current_reconnect_interval = RECONNECT_INTERVAL_MIN
 
         _LOGGER.debug(
-            "Coordinator initialized for %s at %s:%s",
-            name, host, port
+            "Coordinator initialized for %s (primary=%s, secondary=%s, port=%s)",
+            name,
+            self.primary_host,
+            self.secondary_host,
+            port,
         )
 
     @property
@@ -71,6 +77,27 @@ class AndroidMediaPlayerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def ws_url(self) -> str:
         """Return the WebSocket URL for the Android device."""
         return f"ws://{self.host}:{self.port}/ws"
+
+    @property
+    def active_host(self) -> str:
+        """Return the currently active host."""
+        return self.host
+
+    def _ordered_hosts(self, prefer_last_working: bool) -> list[str]:
+        """Return hosts in preferred connection order."""
+        hosts = [self.primary_host]
+        if self.secondary_host:
+            hosts.append(self.secondary_host)
+
+        if (
+            prefer_last_working
+            and self._last_working_host
+            and self._last_working_host in hosts
+        ):
+            return [self._last_working_host] + [
+                host for host in hosts if host != self._last_working_host
+            ]
+        return hosts
 
     @property
     def available(self) -> bool:
@@ -85,13 +112,15 @@ class AndroidMediaPlayerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_connect(self) -> None:
         """Connect to the Android device."""
         _LOGGER.info(
-            "Initiating connection to Android Media Player '%s' at %s",
-            self.device_name, self.ws_url
+            "Initiating connection to Android Media Player '%s' (primary=%s, secondary=%s)",
+            self.device_name,
+            self.primary_host,
+            self.secondary_host,
         )
         self._should_reconnect = True
         self._reconnect_count = 0
         self._current_reconnect_interval = RECONNECT_INTERVAL_MIN
-        await self._connect_websocket()
+        await self._connect_websocket(prefer_last_working=False)
 
     async def async_disconnect(self) -> None:
         """Disconnect from the Android device."""
@@ -124,56 +153,82 @@ class AndroidMediaPlayerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._connected = False
         _LOGGER.info("Disconnected from Android Media Player '%s'", self.device_name)
 
-    async def _connect_websocket(self) -> None:
+    async def _connect_websocket(self, prefer_last_working: bool = True) -> None:
         """Establish WebSocket connection."""
+        hosts_to_try = self._ordered_hosts(prefer_last_working)
         _LOGGER.debug(
-            "Attempting WebSocket connection to %s (timeout: %ds)",
-            self.ws_url, CONNECTION_TIMEOUT
+            "Attempting WebSocket connection for '%s' using hosts %s (timeout: %ds)",
+            self.device_name,
+            hosts_to_try,
+            CONNECTION_TIMEOUT,
         )
-        try:
-            self._ws = await asyncio.wait_for(
-                websockets.connect(
-                    self.ws_url,
-                    ping_interval=WS_HEARTBEAT,
-                    ping_timeout=WS_HEARTBEAT,
-                ),
-                timeout=CONNECTION_TIMEOUT,
-            )
-            self._connected = True
-            self._reconnect_count = 0
-            self._current_reconnect_interval = RECONNECT_INTERVAL_MIN
-            _LOGGER.info(
-                "Successfully connected to Android Media Player '%s' at %s",
-                self.device_name, self.ws_url
-            )
 
-            # Fetch initial state via REST
-            await self.async_get_state()
+        for index, host in enumerate(hosts_to_try):
+            self.host = host
+            _LOGGER.debug(
+                "Trying host %s/%s for '%s': %s",
+                index + 1,
+                len(hosts_to_try),
+                self.device_name,
+                self.ws_url,
+            )
+            try:
+                self._ws = await asyncio.wait_for(
+                    websockets.connect(
+                        self.ws_url,
+                        ping_interval=WS_HEARTBEAT,
+                        ping_timeout=WS_HEARTBEAT,
+                    ),
+                    timeout=CONNECTION_TIMEOUT,
+                )
+                self._connected = True
+                self._last_working_host = host
+                self._reconnect_count = 0
+                self._current_reconnect_interval = RECONNECT_INTERVAL_MIN
+                _LOGGER.info(
+                    "Connected to Android Media Player '%s' via host %s",
+                    self.device_name,
+                    host,
+                )
 
-            # Start listening for messages
-            self._ws_task = asyncio.create_task(self._listen_websocket())
+                # Fetch initial state via REST
+                await self.async_get_state()
 
-        except asyncio.TimeoutError:
-            _LOGGER.warning(
-                "Connection timeout to Android Media Player '%s' at %s after %ds",
-                self.device_name, self.ws_url, CONNECTION_TIMEOUT
-            )
-            self._connected = False
-            self._schedule_reconnect()
-        except ConnectionRefusedError:
-            _LOGGER.warning(
-                "Connection refused by Android Media Player '%s' at %s - is the app running?",
-                self.device_name, self.ws_url
-            )
-            self._connected = False
-            self._schedule_reconnect()
-        except Exception as err:
-            _LOGGER.warning(
-                "Failed to connect to Android Media Player '%s' at %s: %s (%s)",
-                self.device_name, self.ws_url, err, type(err).__name__
-            )
-            self._connected = False
-            self._schedule_reconnect()
+                # Start listening for messages
+                self._ws_task = asyncio.create_task(self._listen_websocket())
+                return
+
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "Connection timeout to '%s' via host %s after %ds",
+                    self.device_name,
+                    host,
+                    CONNECTION_TIMEOUT,
+                )
+            except ConnectionRefusedError:
+                _LOGGER.warning(
+                    "Connection refused by '%s' via host %s - is the app running?",
+                    self.device_name,
+                    host,
+                )
+            except Exception as err:
+                _LOGGER.warning(
+                    "Failed to connect to '%s' via host %s: %s (%s)",
+                    self.device_name,
+                    host,
+                    err,
+                    type(err).__name__,
+                )
+
+            if index < len(hosts_to_try) - 1:
+                _LOGGER.info(
+                    "Failing over '%s' to alternate host %s",
+                    self.device_name,
+                    hosts_to_try[index + 1],
+                )
+
+        self._connected = False
+        self._schedule_reconnect()
 
     async def _listen_websocket(self) -> None:
         """Listen for WebSocket messages."""
@@ -258,8 +313,11 @@ class AndroidMediaPlayerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._reconnect_task = None
         if self._should_reconnect:
             _LOGGER.info(
-                "Attempting reconnect #%d to Android Media Player '%s' (next delay: %ds)...",
-                self._reconnect_count, self.device_name, self._current_reconnect_interval
+                "Attempting reconnect #%d to Android Media Player '%s' (last host=%s, next delay: %ds)...",
+                self._reconnect_count,
+                self.device_name,
+                self._last_working_host,
+                self._current_reconnect_interval,
             )
             await self._connect_websocket()
 

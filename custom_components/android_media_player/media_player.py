@@ -45,10 +45,11 @@ async def async_setup_entry(
     coordinator: AndroidMediaPlayerCoordinator = hass.data[DOMAIN][entry.entry_id]
 
     _LOGGER.info(
-        "Setting up Android Media Player entity for '%s' (%s:%s)",
+        "Setting up Android Media Player entity for '%s' (primary=%s, secondary=%s, port=%s)",
         entry.data.get(CONF_NAME),
-        entry.data[CONF_HOST],
-        entry.data[CONF_PORT],
+        coordinator.primary_host,
+        coordinator.secondary_host,
+        coordinator.port,
     )
 
     async_add_entities([AndroidMediaPlayerEntity(coordinator, entry)])
@@ -190,6 +191,13 @@ class AndroidMediaPlayerEntity(CoordinatorEntity[AndroidMediaPlayerCoordinator],
         if data.get("mediaPosition") is not None:
             return dt_util.utcnow()
         return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return additional state attributes."""
+        return {
+            "active_host": self.coordinator.active_host,
+        }
 
     async def async_added_to_hass(self) -> None:
         """Run when entity is added to hass."""
