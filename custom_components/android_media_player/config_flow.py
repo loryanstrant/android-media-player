@@ -15,6 +15,7 @@ from homeassistant.exceptions import HomeAssistantError
 from .const import (
     DOMAIN,
     CONF_HOST,
+    CONF_NAME,
     CONF_SECONDARY_HOST,
     CONF_PORT,
     DEFAULT_PORT,
