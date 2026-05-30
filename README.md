@@ -187,10 +187,34 @@ All build tools are installed **locally** in the project directory - nothing is 
 
 **Prerequisites for wireless deployment:**
 
-| Android Version | Setup Steps |
-|-----------------|-------------|
-| 11+ | Settings → Developer options → Wireless debugging → Enable |
-| 10 | Connect USB → Run `adb tcpip 5555` → Disconnect USB |
+ADB must be able to reach the device over the network first. The setup differs by Android version.
+
+<details>
+<summary><strong>Android 11+ — Wireless debugging with pairing code (e.g. Samsung Galaxy S24)</strong></summary>
+
+Android 11+ requires a **one-time pairing** before ADB will connect, and Wireless debugging listens on a **random port** (not 5555). Connecting straight to `5555` without pairing fails with `failed to connect ... Connection refused`.
+
+1. On the device: **Settings → Developer options → Wireless debugging → Enable**
+2. Tap **Pair device with pairing code** — note the `IP:port` and the 6-digit code shown
+3. Pair from your PC, using the **pairing** `IP:port` shown on the device (not 5555):
+   ```bash
+   android-sdk/platform-tools/adb pair <device-ip>:<pairing-port>
+   ```
+   Enter the 6-digit code when prompted.
+4. The main **Wireless debugging** screen shows a (different) `IP:port` for the actual connection. If that port isn't 5555, pass it as the **4th argument** to the deploy script:
+   ```bash
+   # Arguments: <device-ip> [device-name] [server-port] [adb-port]
+   ./deploy.sh <device-ip> "Living Room" 8765 <adb-connect-port>
+   ```
+</details>
+
+<details>
+<summary><strong>Android 10 — enable TCP/IP ADB over USB</strong></summary>
+
+1. Connect the device via USB
+2. Run `android-sdk/platform-tools/adb tcpip 5555`
+3. Disconnect USB, then run `./deploy.sh <device-ip>`
+</details>
 
 The deploy script will:
 1. Connect to the device over the network
@@ -758,13 +782,13 @@ The integration supports a **Host** (LAN) and a **Secondary Host** (VPN) with au
 </details>
 
 <details>
-<summary><strong>Deploy script can't connect</strong></summary>
+<summary><strong>Deploy script can't connect (<code>Connection refused</code> on 5555)</strong></summary>
 
-- Enable wireless debugging on Android 11+
-- For Android 10: Connect USB first, run `adb tcpip 5555`
-- Verify device IP address
-- Check port 5555 isn't firewalled
-- Ensure ADB is in PATH or use local SDK
+- **Android 11+:** Wireless debugging needs a one-time **pairing** and uses a **random port**, not 5555. Enable Wireless debugging, **Pair device with pairing code** (`adb pair <ip>:<pairing-port>`), then pass the connection port shown on-device as the 4th deploy argument: `./deploy.sh <ip> "Name" 8765 <adb-port>`. See [Deploying to Android Device](#deploying-to-android-device).
+- **Android 10:** Connect USB first, run `adb tcpip 5555`, then disconnect
+- Verify the device IP address
+- Check the ADB port isn't firewalled
+- Ensure ADB is in PATH or use the local SDK (`android-sdk/platform-tools/adb`)
 </details>
 
 ---
