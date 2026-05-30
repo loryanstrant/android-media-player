@@ -6,11 +6,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
-import android.net.wifi.WifiManager
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
-import android.text.format.Formatter
 import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -552,33 +553,79 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun getLocalIpAddress(): String? {
+        // Report the address Home Assistant can actually reach right now, in priority:
+        //   1. WiFi LAN address  (home / primary host)
+        //   2. VPN tunnel address (remote via WireGuard / secondary host)
+        // The cellular 464XLAT clat address (v4-*, 192.0.0.x) is never reachable from
+        // HA and must never be reported.
         try {
-            // Try WiFi first
-            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            val wifiInfo = wifiManager.connectionInfo
-            val ipInt = wifiInfo.ipAddress
-            if (ipInt != 0) {
-                @Suppress("DEPRECATION")
-                val ip = Formatter.formatIpAddress(ipInt)
-                AppLog.v(TAG, "Got IP from WiFi: $ip")
-                return ip
+            val cm = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            @Suppress("DEPRECATION")
+            val networks = cm.allNetworks
+
+            // 1. Physical WiFi LAN (not a VPN running over WiFi: a VPN inherits the
+            //    underlying WIFI transport, so require NOT_VPN to exclude it).
+            for (network in networks) {
+                val caps = cm.getNetworkCapabilities(network) ?: continue
+                if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) continue
+                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)) continue
+                firstUsableIpv4(cm.getLinkProperties(network))?.let {
+                    AppLog.v(TAG, "Got WiFi LAN IP via ConnectivityManager: $it")
+                    return it
+                }
             }
 
-            // Fallback to network interfaces
-            val interfaces = NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val networkInterface = interfaces.nextElement()
-                val addresses = networkInterface.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val address = addresses.nextElement()
-                    if (!address.isLoopbackAddress && address is Inet4Address) {
-                        AppLog.v(TAG, "Got IP from network interface ${networkInterface.name}: ${address.hostAddress}")
-                        return address.hostAddress
-                    }
+            // 2. VPN tunnel (e.g. WireGuard tun0) — how HA reaches the phone when away.
+            for (network in networks) {
+                val caps = cm.getNetworkCapabilities(network) ?: continue
+                if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+                firstUsableIpv4(cm.getLinkProperties(network))?.let {
+                    AppLog.v(TAG, "Got VPN tunnel IP via ConnectivityManager: $it")
+                    return it
+                }
+            }
+        } catch (e: Exception) {
+            AppLog.w(TAG, "ConnectivityManager IP lookup failed: ${e.message}")
+        }
+
+        // Fallback: enumerate interfaces. Prefer wlan/eth, then VPN tun; never the
+        // 464XLAT clat interface (v4-*, 192.0.0.0/24) or raw cellular (rmnet/ppp).
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces().toList().sortedBy {
+                when {
+                    it.name.startsWith("wlan") -> 0
+                    it.name.startsWith("eth") -> 1
+                    it.name.startsWith("tun") -> 2
+                    else -> 3
+                }
+            }
+            for (networkInterface in interfaces) {
+                if (networkInterface.isLoopback || !networkInterface.isUp) continue
+                val name = networkInterface.name
+                if (name.startsWith("v4-") || name.startsWith("rmnet") || name.startsWith("ppp")) continue
+                for (address in networkInterface.inetAddresses) {
+                    if (address.isLoopbackAddress || address !is Inet4Address) continue
+                    val host = address.hostAddress ?: continue
+                    if (host.startsWith("192.0.0.")) continue
+                    AppLog.v(TAG, "Got IP from network interface $name: $host")
+                    return host
                 }
             }
         } catch (e: Exception) {
             AppLog.e(TAG, "Error getting IP address: ${e.message}", e)
+        }
+        return null
+    }
+
+    /** Returns the first non-loopback, non-clat IPv4 address from the given link, or null. */
+    private fun firstUsableIpv4(linkProps: LinkProperties?): String? {
+        if (linkProps == null) return null
+        for (linkAddress in linkProps.linkAddresses) {
+            val address = linkAddress.address
+            if (address is Inet4Address && !address.isLoopbackAddress) {
+                val host = address.hostAddress ?: continue
+                if (!host.startsWith("192.0.0.")) return host
+            }
         }
         return null
     }

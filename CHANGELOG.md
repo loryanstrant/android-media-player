@@ -86,6 +86,14 @@ Git tags use the **Server version** (e.g., `v3.0.0`). APK versions are tracked s
 
 # Android APK Changelog
 
+## [2.0.8] - 2026-05-30
+
+### Fixed
+- **Home Assistant connection timeouts while idle** - Switched the Wi-Fi lock from the deprecated `WIFI_MODE_FULL_HIGH_PERF` (a no-op on Android 10+) to `WIFI_MODE_FULL_LOW_LATENCY` on API 29+, so the Wi-Fi radio no longer drops into power-save and stops responding to Home Assistant while the device is idle / screen-off. The integration's `TimeoutError` on connect was the radio sleeping, not a bad host/port. Best paired with setting the app's battery usage to **Unrestricted**.
+- **Wrong IP address reported on cellular/VPN** - `getLocalIpAddress()` now reports the address Home Assistant can actually reach — the Wi-Fi LAN address when on Wi-Fi, the VPN tunnel address when away — and never the IPv6-only 464XLAT clat address (`192.0.0.x`) or a VPN-over-Wi-Fi address. Uses `ConnectivityManager` transport queries (WiFi + `NOT_VPN`, then VPN) instead of the deprecated `WifiInfo.getIpAddress()` (which returns 0 on Android 12+).
+
+---
+
 ## [2.0.7] - 2026-01-18
 
 ### Fixed
