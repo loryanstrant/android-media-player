@@ -140,23 +140,17 @@ class MediaPlayerService : Service() {
 
         if (wifiLock == null) {
             val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            // WIFI_MODE_FULL_HIGH_PERF is deprecated and a no-op on Android 10+ (API 29),
+            // WIFI_MODE_FULL_HIGH_PERF is deprecated and a no-op on Android 10+ (API 29+),
             // so the radio still enters power-save and drops/delays inbound packets while idle.
-            // Use WIFI_MODE_FULL_LOW_LATENCY on API 29+ to keep the server reachable.
-            val lockMode = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-            } else {
-                @Suppress("DEPRECATION")
-                WifiManager.WIFI_MODE_FULL_HIGH_PERF
-            }
+            // minSdk is 29, so always use WIFI_MODE_FULL_LOW_LATENCY to keep the server reachable.
             wifiLock = wifiManager.createWifiLock(
-                lockMode,
+                WifiManager.WIFI_MODE_FULL_LOW_LATENCY,
                 "AndroidMediaPlayer::WifiLock"
             ).apply {
                 setReferenceCounted(false)
                 acquire()
             }
-            AppLog.i(TAG, "WiFi lock acquired (mode=$lockMode)")
+            AppLog.i(TAG, "WiFi lock acquired (mode=FULL_LOW_LATENCY)")
         }
     }
 

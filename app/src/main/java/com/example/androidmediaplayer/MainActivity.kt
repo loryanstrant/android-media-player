@@ -26,6 +26,7 @@ import com.example.androidmediaplayer.util.UpdateManager
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.NetworkInterface
 
 class MainActivity : AppCompatActivity() {
@@ -591,7 +592,8 @@ class MainActivity : AppCompatActivity() {
         // Fallback: enumerate interfaces. Prefer wlan/eth, then VPN tun; never the
         // 464XLAT clat interface (v4-*, 192.0.0.0/24) or raw cellular (rmnet/ppp).
         try {
-            val interfaces = NetworkInterface.getNetworkInterfaces().toList().sortedBy {
+            // getNetworkInterfaces() can return null per the API contract.
+            val interfaces = (NetworkInterface.getNetworkInterfaces()?.toList() ?: emptyList()).sortedBy {
                 when {
                     it.name.startsWith("wlan") -> 0
                     it.name.startsWith("eth") -> 1
@@ -604,9 +606,8 @@ class MainActivity : AppCompatActivity() {
                 val name = networkInterface.name
                 if (name.startsWith("v4-") || name.startsWith("rmnet") || name.startsWith("ppp")) continue
                 for (address in networkInterface.inetAddresses) {
-                    if (address.isLoopbackAddress || address !is Inet4Address) continue
+                    if (!isUsableIpv4(address)) continue
                     val host = address.hostAddress ?: continue
-                    if (host.startsWith("192.0.0.")) continue
                     AppLog.v(TAG, "Got IP from network interface $name: $host")
                     return host
                 }
@@ -617,17 +618,25 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
-    /** Returns the first non-loopback, non-clat IPv4 address from the given link, or null. */
+    /** Returns the first routable IPv4 address from the given link, or null. */
     private fun firstUsableIpv4(linkProps: LinkProperties?): String? {
         if (linkProps == null) return null
         for (linkAddress in linkProps.linkAddresses) {
-            val address = linkAddress.address
-            if (address is Inet4Address && !address.isLoopbackAddress) {
-                val host = address.hostAddress ?: continue
-                if (!host.startsWith("192.0.0.")) return host
-            }
+            if (isUsableIpv4(linkAddress.address)) return linkAddress.address.hostAddress
         }
         return null
+    }
+
+    /**
+     * True for an IPv4 address Home Assistant can actually reach: excludes loopback,
+     * link-local (169.254.0.0/16), any-local (0.0.0.0), and the 464XLAT clat range
+     * (192.0.0.0/24, e.g. 192.0.0.4 on IPv6-only cellular).
+     */
+    private fun isUsableIpv4(address: InetAddress): Boolean {
+        if (address !is Inet4Address) return false
+        if (address.isLoopbackAddress || address.isLinkLocalAddress || address.isAnyLocalAddress) return false
+        val host = address.hostAddress ?: return false
+        return !host.startsWith("192.0.0.")
     }
 
     private fun observePlayerState() {
