@@ -187,10 +187,34 @@ All build tools are installed **locally** in the project directory - nothing is 
 
 **Prerequisites for wireless deployment:**
 
-| Android Version | Setup Steps |
-|-----------------|-------------|
-| 11+ | Settings → Developer options → Wireless debugging → Enable |
-| 10 | Connect USB → Run `adb tcpip 5555` → Disconnect USB |
+ADB must be able to reach the device over the network first. The setup differs by Android version.
+
+<details>
+<summary><strong>Android 11+ — Wireless debugging with pairing code (e.g. Samsung Galaxy S24)</strong></summary>
+
+Android 11+ requires a **one-time pairing** before ADB will connect, and Wireless debugging listens on a **random port** (not 5555). Connecting straight to `5555` without pairing fails with `failed to connect ... Connection refused`.
+
+1. On the device: **Settings → Developer options → Wireless debugging → Enable**
+2. Tap **Pair device with pairing code** — note the `IP:port` and the 6-digit code shown
+3. Pair from your PC, using the **pairing** `IP:port` shown on the device (not 5555):
+   ```bash
+   android-sdk/platform-tools/adb pair <device-ip>:<pairing-port>
+   ```
+   Enter the 6-digit code when prompted.
+4. The main **Wireless debugging** screen shows a (different) `IP:port` for the actual connection. If that port isn't 5555, pass it as the **4th argument** to the deploy script:
+   ```bash
+   # Arguments: <device-ip> [device-name] [server-port] [adb-port]
+   ./deploy.sh <device-ip> "Living Room" 8765 <adb-connect-port>
+   ```
+</details>
+
+<details>
+<summary><strong>Android 10 — enable TCP/IP ADB over USB</strong></summary>
+
+1. Connect the device via USB
+2. Run `android-sdk/platform-tools/adb tcpip 5555`
+3. Disconnect USB, then run `./deploy.sh <device-ip>`
+</details>
 
 The deploy script will:
 1. Connect to the device over the network
@@ -673,6 +697,53 @@ The app includes a watchdog that monitors the media player service:
 </details>
 
 <details>
+<summary><strong>Home Assistant connect fails with <code>TimeoutError</code> (works intermittently)</strong></summary>
+
+Almost always **Wi-Fi power-save / Doze on the Android device dropping inbound packets while idle**, not a wrong host/port. The HTTP server binds all interfaces and works fine — the radio is just asleep when HA tries to connect.
+
+**Diagnose** by pinging the device from another LAN host:
+
+```bash
+ping <device-ip>
+```
+
+- ~1–5 ms (matching your gateway) = healthy
+- 50–180 ms erratic, or intermittent 100% loss = Wi-Fi power-save / deep Doze
+
+**Fix:**
+1. Set the app to **Battery → Unrestricted** (Settings → Apps → Android Media Player → Battery). This exempts it from Doze, which otherwise silently drops all inbound traffic. `deploy.sh` also adds the app to the Doze whitelist, but the user-facing setting is what reliably sticks.
+2. Ensure you are running APK **2.0.8+**, which holds a `WIFI_MODE_FULL_LOW_LATENCY` Wi-Fi lock. (Earlier builds used `WIFI_MODE_FULL_HIGH_PERF`, which is a **no-op on Android 10+**, so the radio still slept.)
+3. For a wall-mounted/kiosk device, keeping the **screen on** gives the most consistent latency (low-latency mode fully engages only with the screen on).
+
+Note: increasing the integration's connection timeout does **not** help — a dozing radio can be unreachable far longer than any reasonable timeout. The radio has to stay awake.
+</details>
+
+<details>
+<summary><strong>App shows the wrong IP (e.g. <code>192.0.0.4</code>) or "No network connection"</strong></summary>
+
+`192.0.0.4` is Android's **464XLAT clat** address (`v4-rmnet0`) — an internal IPv4 shim used on IPv6-only mobile data. It is never reachable from Home Assistant and should never be used.
+
+APK **2.0.8+** reports the address HA can actually reach, in priority:
+
+- **On Wi-Fi** → the Wi-Fi LAN address (e.g. `192.168.1.100`) — use as the **Host**
+- **Off Wi-Fi with the VPN up** → the VPN tunnel address (e.g. `192.168.175.2`) — use as the **Secondary Host**
+- The cellular clat (`192.0.0.x`) is never shown
+
+If the app shows **"No network connection"**, the device is on cellular with **no VPN connected** — there is no address HA can reach. Connect Wi-Fi or bring up the VPN.
+</details>
+
+<details>
+<summary><strong>Remote access over VPN / WireGuard (away from home)</strong></summary>
+
+The integration supports a **Host** (LAN) and a **Secondary Host** (VPN) with automatic failover, so HA reaches the device on the LAN at home and over the tunnel when away.
+
+1. **Configure both hosts in HA:** Host = the LAN IP, Secondary Host = the device's WireGuard tunnel IP (the static `Address` from the phone's WireGuard `[Interface]`).
+2. **The app must route through the tunnel.** Because the app is a *server*, replies to an HA request arriving on the tunnel only return through it if the app's traffic is bound to the VPN. With a per-app/split-tunnel VPN (e.g. **WG-Tunnel**) in "include selected apps" mode, **add "Android Media Player" to the included list** — otherwise replies leak out the cellular interface and HA can't connect. Simpler alternatives: use the VPN's *exclude* mode (don't exclude this app) or tunnel all apps.
+3. **Keep the device reachable through carrier NAT:** set **`PersistentKeepalive = 25`** on the device's WireGuard peer, or HA-initiated connections can't traverse the NAT.
+4. **Test from the HA host:** `curl http://<tunnel-ip>:8765/` should return the device JSON. If it hangs, the issue is in the VPN routing/keepalive layer, not the app.
+</details>
+
+<details>
 <summary><strong>Media won't play</strong></summary>
 
 - Verify URL is accessible from the Android device
@@ -711,13 +782,13 @@ The app includes a watchdog that monitors the media player service:
 </details>
 
 <details>
-<summary><strong>Deploy script can't connect</strong></summary>
+<summary><strong>Deploy script can't connect (<code>Connection refused</code> on 5555)</strong></summary>
 
-- Enable wireless debugging on Android 11+
-- For Android 10: Connect USB first, run `adb tcpip 5555`
-- Verify device IP address
-- Check port 5555 isn't firewalled
-- Ensure ADB is in PATH or use local SDK
+- **Android 11+:** Wireless debugging needs a one-time **pairing** and uses a **random port**, not 5555. Enable Wireless debugging, **Pair device with pairing code** (`adb pair <ip>:<pairing-port>`), then pass the connection port shown on-device as the 4th deploy argument: `./deploy.sh <ip> "Name" 8765 <adb-port>`. See [Deploying to Android Device](#deploying-to-android-device).
+- **Android 10:** Connect USB first, run `adb tcpip 5555`, then disconnect
+- Verify the device IP address
+- Check the ADB port isn't firewalled
+- Ensure ADB is in PATH or use the local SDK (`android-sdk/platform-tools/adb`)
 </details>
 
 ---
